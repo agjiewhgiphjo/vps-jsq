@@ -35,6 +35,10 @@ npx wrangler deploy
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/verkyer/vps-jsq)
 
+#### 一键 Edgeone Pages 部署：
+
+[![使用 EdgeOne Pages 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?repository-url=https://github.com/verkyer/vps-jsq)
+
 ## 🛠️ 开发与构建
 
 本项目使用 Vite + Tailwind CSS 构建。

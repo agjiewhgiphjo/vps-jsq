@@ -37,7 +37,7 @@ npx wrangler deploy
 
 #### 一键 Edgeone Pages 部署：
 
-[![使用 EdgeOne Pages 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?repository-url=https://github.com/verkyer/vps-jsq)
+[![使用 EdgeOne Pages 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?repository-url=https://github.com/agjiewhgiphjo/vps-jsq)
 
 ## 🛠️ 开发与构建
 

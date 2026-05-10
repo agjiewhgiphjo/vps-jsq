@@ -1,7 +1,21 @@
 ﻿import './style.css';
 
+// Firefox 检测：为 html 添加标识类，供 CSS 针对性处理原生控件差异
+if (typeof navigator !== 'undefined' && /firefox/i.test(navigator.userAgent)) {
+    document.documentElement.classList.add('is-firefox');
+}
+
 const API_URL = 'https://open.er-api.com/v6/latest/CNY';
+// 汇率本地缓存时长（小时）。免费 API 一般每天更新一次，12h 足够。
+const RATE_CACHE_HOURS = 12;
+// 用户手动刷新汇率次数上限（每 RATE_CACHE_HOURS 内）。防止误触刷爆免费 API 配额。
+const MANUAL_REFRESH_LIMIT = 2;
+const EXPORT_BORDER_RADIUS = 12;
+const SHARE_IMAGE_MIME_TYPE = 'image/webp';
+const SHARE_IMAGE_QUALITY = 0.98;
+const SHARE_IMAGE_PIXEL_RATIO = 2;
 let htmlToImageModulePromise = null;
+let generatedImageUrl = '';
 
 const currencySymbols = {
     'USD': '$', 'EUR': '\u20AC', 'GBP': '\u00A3', 'JPY': '\u00A5',
@@ -14,9 +28,7 @@ const els = {
     currency: document.getElementById('currency'),
     cycles: document.getElementsByName('cycle'),
     dueDate: document.getElementById('dueDate'),
-    dueDateDisplay: document.getElementById('dueDateDisplay'),
     tradeDate: document.getElementById('tradeDate'),
-    tradeDateDisplay: document.getElementById('tradeDateDisplay'),
     customRate: document.getElementById('customRate'),
     apiRateDisplay: document.getElementById('apiRateDisplay'),
     refreshBtn: document.getElementById('refreshRateBtn'),
@@ -24,6 +36,9 @@ const els = {
     symbolDisplay: document.querySelector('.symbol-display'),
     finalValue: document.getElementById('finalValue'),
     originalCurrencyValue: document.getElementById('originalCurrencyValue'),
+    amountCopyTip: document.getElementById('amountCopyTip'),
+    premiumInput: document.getElementById('premiumInput'),
+    salePriceInput: document.getElementById('salePriceInput'),
     daysRemaining: document.getElementById('daysRemaining'),
     progressBar: document.getElementById('progressBar'),
     progressText: document.getElementById('progressText'),
@@ -35,27 +50,46 @@ const els = {
 };
 
 let rateLimitTimer = null;
+let remainingValueCNY = 0;
+let quoteLastEdited = 'premium';
 
 window.addEventListener('DOMContentLoaded', () => {
-    initTheme();
-    loadInputsFromCookie(); 
-    initDates(); 
-    initRates(); 
-    setupEventListeners();
-    calculate(); 
+    try {
+        initTheme();
+        loadInputsFromCookie(); 
+        initQuoteFields();
+        initDates(); 
+        syncDateDisplay(els.dueDate);
+        syncDateDisplay(els.tradeDate);
+        initRates(); 
+        setupEventListeners();
+        calculate(); 
+    } finally {
+        hideAppLoader();
+    }
 });
+
+function hideAppLoader() {
+    const loader = document.getElementById('appLoader');
+    if (!loader) return;
+
+    requestAnimationFrame(() => {
+        loader.classList.add('is-hidden');
+        window.setTimeout(() => loader.remove(), 180);
+    });
+}
 
 function setupEventListeners() {
     const debouncedSave = debounce(saveInputsToCookie, 500);
 
     [els.price, els.dueDate, els.tradeDate, els.customRate].forEach(el => el.addEventListener('input', () => {
-        syncDateDisplays();
+        if (el.type === 'date') syncDateDisplay(el);
         calculate();
         debouncedSave();
     }));
 
     [els.dueDate, els.tradeDate].forEach(el => el.addEventListener('change', () => {
-        syncDateDisplays();
+        syncDateDisplay(el);
         calculate();
         saveInputsToCookie();
     }));
@@ -68,13 +102,178 @@ function setupEventListeners() {
     els.currency.addEventListener('change', () => {
         updateCurrencySymbol();
         initRates(); 
-        syncDateDisplays();
         calculate();
         saveInputsToCookie();
     });
 
     els.refreshBtn.addEventListener('click', manualRefreshRate); 
     els.themeToggle.addEventListener('click', toggleTheme);
+    els.finalValue.addEventListener('click', copyFinalValueAmount);
+    els.finalValue.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        copyFinalValueAmount();
+    });
+
+    [els.premiumInput, els.salePriceInput].forEach(el => {
+        el.addEventListener('input', () => {
+            quoteLastEdited = el === els.salePriceInput ? 'sale' : 'premium';
+            syncQuoteFields();
+            debouncedSave();
+        });
+
+        el.addEventListener('blur', () => {
+            syncQuoteFields({ formatActive: true });
+            saveInputsToCookie();
+        });
+    });
+
+    // Firefox：date input 改为 visibility:hidden，不接收点击 → 在 wrapper 上绑定点击来触发 showPicker()
+    // 非 Firefox：原生透明日历指示器在 webkit 上会自己响应点击，同时下面的 icon handler 作为后备
+    if (document.documentElement.classList.contains('is-firefox')) {
+        document.querySelectorAll('.date-input-wrapper').forEach((wrapper) => {
+            wrapper.addEventListener('click', () => {
+                const input = wrapper.querySelector('input[type="date"]');
+                if (!input) return;
+                try {
+                    if (typeof input.showPicker === 'function') {
+                        input.showPicker();
+                    } else {
+                        input.focus();
+                    }
+                } catch (err) {
+                    // ignore
+                }
+            });
+        });
+    } else {
+        // 非 Firefox：点击右侧自定义日历图标触发 picker
+        document.querySelectorAll('.date-input-wrapper .date-input-icon').forEach((icon) => {
+            icon.addEventListener('click', (e) => {
+                const input = icon.parentElement && icon.parentElement.querySelector('input[type="date"]');
+                if (!input) return;
+                e.preventDefault();
+                try {
+                    if (typeof input.showPicker === 'function') {
+                        input.showPicker();
+                    } else {
+                        input.focus();
+                    }
+                } catch (err) {
+                    input.focus();
+                }
+            });
+        });
+    }
+
+    // 价格 / 汇率 输入校验：负数或非法时高亮红边
+    [els.price, els.customRate].forEach(el => {
+        el.addEventListener('input', () => validateNumberInput(el));
+        validateNumberInput(el);
+    });
+
+    els.salePriceInput.addEventListener('input', () => validateNumberInput(els.salePriceInput));
+    validateNumberInput(els.salePriceInput);
+
+    // ESC 关闭模态 / 限流提示
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        if (!modal.el.classList.contains('hidden')) closeImageModal();
+        if (els.rateLimitTip.classList.contains('show')) hideRateLimitTip();
+    });
+}
+
+function validateNumberInput(el) {
+    const raw = el.value.trim();
+    if (raw === '') {
+        el.classList.remove('input-invalid');
+        return true;
+    }
+    const v = parseFloat(raw);
+    const ok = Number.isFinite(v) && v >= 0;
+    el.classList.toggle('input-invalid', !ok);
+    return ok;
+}
+
+function initQuoteFields() {
+    updateQuotePlaceholders();
+    syncQuoteFields();
+}
+
+function parseQuoteValue(value) {
+    if (typeof value !== 'string' || value.trim() === '') return NaN;
+    return parseFloat(value);
+}
+
+function formatMoney(value) {
+    return Number.isFinite(value) ? value.toFixed(2) : '';
+}
+
+function updatePremiumTone(value) {
+    els.premiumInput.classList.remove('premium-positive', 'premium-negative', 'premium-neutral');
+
+    if (!Number.isFinite(value) || value === 0) {
+        els.premiumInput.classList.add('premium-neutral');
+    } else if (value > 0) {
+        els.premiumInput.classList.add('premium-positive');
+    } else {
+        els.premiumInput.classList.add('premium-negative');
+    }
+}
+
+function updateSaleTone(isNeutral) {
+    els.salePriceInput.classList.toggle('sale-neutral', isNeutral);
+}
+
+function updateQuotePlaceholders() {
+    els.premiumInput.placeholder = '0.00';
+    els.salePriceInput.placeholder = formatMoney(remainingValueCNY) || '0.00';
+}
+
+function syncQuoteFields(options = {}) {
+    const { formatActive = false } = options;
+    const premiumRaw = els.premiumInput.value.trim();
+    const saleRaw = els.salePriceInput.value.trim();
+
+    updateQuotePlaceholders();
+
+    if (quoteLastEdited === 'sale') {
+        const salePrice = parseQuoteValue(saleRaw);
+
+        if (Number.isFinite(salePrice)) {
+            const premium = salePrice - remainingValueCNY;
+            els.premiumInput.value = formatMoney(premium);
+            if (formatActive) els.salePriceInput.value = formatMoney(salePrice);
+            updatePremiumTone(premium);
+            updateSaleTone(false);
+        } else {
+            els.premiumInput.value = '';
+            updatePremiumTone(NaN);
+            updateSaleTone(true);
+        }
+        return;
+    }
+
+    const premium = premiumRaw === '' ? 0 : parseQuoteValue(els.premiumInput.value);
+
+    if (Number.isFinite(premium)) {
+        if (premiumRaw === '') {
+            els.salePriceInput.value = '';
+            updatePremiumTone(0);
+            updateSaleTone(true);
+            return;
+        }
+
+        const salePrice = remainingValueCNY + premium;
+        els.salePriceInput.value = formatMoney(salePrice);
+        if (formatActive) els.premiumInput.value = formatMoney(premium);
+        updatePremiumTone(premium);
+        updateSaleTone(premiumRaw === '' || premium === 0);
+    } else {
+        els.salePriceInput.value = '';
+        updatePremiumTone(NaN);
+        updateSaleTone(true);
+    }
 }
 
 function debounce(func, wait) {
@@ -111,6 +310,8 @@ function updateToggleUI(isDark) {
     }
 }
 
+// 注意：函数名沿用历史命名（setCookie / getCookie），实际底层是 localStorage + 过期时间，
+// 同时兼容旧版本可能写到 document.cookie 的数据。
 function setCookie(name, value, hours) {
     const expiresAt = Date.now() + (hours * 60 * 60 * 1000);
     localStorage.setItem(name, JSON.stringify({ value, expiresAt }));
@@ -153,29 +354,139 @@ async function getHtmlToImage() {
     return htmlToImageModulePromise;
 }
 
+function canvasToBlob(canvas, type, quality) {
+    return new Promise((resolve, reject) => {
+        canvas.toBlob((blob) => {
+            if (blob) {
+                resolve(blob);
+            } else {
+                reject(new Error(`Canvas export failed: ${type}`));
+            }
+        }, type, quality);
+    });
+}
+
+function buildRoundedRectPath(ctx, width, height, radius) {
+    const safeRadius = Math.max(0, Math.min(radius, width / 2, height / 2));
+    ctx.beginPath();
+    ctx.moveTo(safeRadius, 0);
+    ctx.lineTo(width - safeRadius, 0);
+    ctx.quadraticCurveTo(width, 0, width, safeRadius);
+    ctx.lineTo(width, height - safeRadius);
+    ctx.quadraticCurveTo(width, height, width - safeRadius, height);
+    ctx.lineTo(safeRadius, height);
+    ctx.quadraticCurveTo(0, height, 0, height - safeRadius);
+    ctx.lineTo(0, safeRadius);
+    ctx.quadraticCurveTo(0, 0, safeRadius, 0);
+    ctx.closePath();
+}
+
+function clipCanvasToRoundedRect(sourceCanvas, radiusPx) {
+    const outputCanvas = document.createElement('canvas');
+    outputCanvas.width = sourceCanvas.width;
+    outputCanvas.height = sourceCanvas.height;
+
+    const ctx = outputCanvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    buildRoundedRectPath(ctx, outputCanvas.width, outputCanvas.height, radiusPx);
+    ctx.clip();
+    ctx.drawImage(sourceCanvas, 0, 0);
+
+    return outputCanvas;
+}
+
+function resetGeneratedImage() {
+    if (generatedImageUrl) {
+        URL.revokeObjectURL(generatedImageUrl);
+    }
+    generatedImageUrl = '';
+}
+
 function formatDateForDisplay(value) {
     return value ? value.replace(/-/g, '/') : '--/--/--';
 }
 
-function syncDateDisplays() {
-    els.dueDateDisplay.textContent = formatDateForDisplay(els.dueDate.value);
-    els.tradeDateDisplay.textContent = formatDateForDisplay(els.tradeDate.value);
+function syncDateDisplay(input) {
+    const wrapper = input && input.parentElement;
+    const display = wrapper && wrapper.querySelector('.date-display-value');
+    if (!display) return;
+    display.textContent = formatDateForDisplay(input.value);
 }
 
 function prepareDateInputsForExport(node) {
     const restoreTasks = [];
-    const nativeInputs = node.querySelectorAll('.date-native');
+    const inputs = node.querySelectorAll('input[type="date"]');
 
-    nativeInputs.forEach((input) => {
-        input.style.display = 'none';
+    inputs.forEach((input) => {
+        const wrapper = input.parentElement;
+        if (!wrapper) return;
+        const display = wrapper.querySelector('.date-display-value') || document.createElement('span');
+        const hadDisplay = wrapper.contains(display);
+        if (!hadDisplay) {
+            display.className = 'date-display-value text-xs md:text-sm font-medium tabular-nums';
+            wrapper.insertBefore(display, input.nextSibling);
+        }
+        display.classList.add('date-display-export');
+        display.textContent = formatDateForDisplay(input.value);
+        // visibility:hidden 而非 display:none：保留 input 在文档流中的占位高度，
+        // 避免 wrapper 塌陷导致 position:absolute 的 display 层变为 0px 高度。
+        input.style.visibility = 'hidden';
 
         restoreTasks.push(() => {
-            input.style.display = '';
+            input.style.visibility = '';
+            display.classList.remove('date-display-export');
+            if (!hadDisplay) display.remove();
         });
     });
 
     return () => {
         restoreTasks.reverse().forEach((restore) => restore());
+    };
+}
+
+/*
+ * html-to-image 序列化时无法可靠保留 -webkit-/-moz-appearance 这类伪元素相关样式，
+ * Firefox 截图里 number input 会重新出现上下调节按钮。导出前用 div 替换，导出后还原。
+ */
+function prepareNumberInputsForExport(node) {
+    const restoreTasks = [];
+    const inputs = node.querySelectorAll('input[type="number"]');
+
+    inputs.forEach((input) => {
+        const display = document.createElement('div');
+        display.className = input.className;
+        const cs = window.getComputedStyle(input);
+        // 保留输入框的对齐方式（部分 number 框是居中显示的）
+        display.style.display = 'flex';
+        display.style.alignItems = 'center';
+        display.style.justifyContent = cs.textAlign === 'center'
+            ? 'center'
+            : (cs.textAlign === 'right' ? 'flex-end' : 'flex-start');
+        // 保留动态计算的左内边距，防止多字符货币符号（如 NT$）在截图时与数值重叠
+        display.style.paddingLeft = cs.paddingLeft;
+        display.textContent = input.value || input.placeholder || '';
+        input.style.display = 'none';
+        input.parentElement && input.parentElement.insertBefore(display, input);
+
+        restoreTasks.push(() => {
+            input.style.display = '';
+            display.remove();
+        });
+    });
+
+    return () => {
+        restoreTasks.reverse().forEach((restore) => restore());
+    };
+}
+
+function prepareQuoteSectionForExport(mainCard) {
+    const premium = parseQuoteValue(els.premiumInput.value);
+    const shouldHideQuote = !Number.isFinite(premium) || premium === 0;
+    mainCard.classList.toggle('quote-export-empty', shouldHideQuote);
+
+    return () => {
+        mainCard.classList.remove('quote-export-empty');
     };
 }
 
@@ -215,7 +526,10 @@ function saveInputsToCookie() {
         currency: els.currency.value,
         cycle: Array.from(els.cycles).find(r => r.checked)?.value || "365",
         dueDate: els.dueDate.value,
-        customRate: els.customRate.value
+        customRate: els.customRate.value,
+        premium: els.premiumInput.value,
+        salePrice: els.salePriceInput.value,
+        quoteLastEdited
     };
     setCookie("vps_inputs", JSON.stringify(data), 0.5);
 }
@@ -229,6 +543,14 @@ function loadInputsFromCookie() {
             if(data.currency) els.currency.value = data.currency;
             if(data.dueDate) els.dueDate.value = data.dueDate;
             if(data.customRate) els.customRate.value = data.customRate;
+            if(data.quoteLastEdited === 'sale' || data.quoteLastEdited === 'premium') {
+                quoteLastEdited = data.quoteLastEdited;
+                if (quoteLastEdited === 'sale' && data.salePrice) {
+                    els.salePriceInput.value = data.salePrice;
+                } else if (quoteLastEdited === 'premium' && data.premium && parseFloat(data.premium) !== 0) {
+                    els.premiumInput.value = data.premium;
+                }
+            }
             if(data.cycle) {
                 const radio = document.querySelector(`input[name="cycle"][value="${data.cycle}"]`);
                 if(radio) radio.checked = true;
@@ -274,13 +596,13 @@ async function manualRefreshRate(isUserClick = true) {
             if (parsed.resetTime && Date.now() < parsed.resetTime) {
                 limitData = parsed;
             } else {
-                limitData = { count: 0, resetTime: Date.now() + 12*3600*1000 };
+                limitData = { count: 0, resetTime: Date.now() + RATE_CACHE_HOURS*3600*1000 };
             }
         } catch(e) {}
     }
 
     if (isUserClick) {
-        if (limitData.count >= 2) {
+        if (limitData.count >= MANUAL_REFRESH_LIMIT) {
             showRateLimitTip();
             return;
         }
@@ -295,30 +617,30 @@ async function manualRefreshRate(isUserClick = true) {
 async function fetchExchangeRate() {
     const base = els.currency.value;
     els.refreshIcon.classList.add('spin');
-    els.apiRateDisplay.textContent = "...";
+    els.apiRateDisplay.textContent = "刷新中";
 
     try {
         const response = await fetch(API_URL);
         const data = await response.json();
         
         if (data.result === "success") {
-            const baseInCNY = data.rates[base];
-            if (baseInCNY) {
+            const baseInCNY = data.rates && data.rates[base];
+            if (typeof baseInCNY === 'number' && baseInCNY > 0 && Number.isFinite(baseInCNY)) {
                 const rate = 1 / baseInCNY;
                 finishRateUpdate(rate, rate.toFixed(4));
                 
                 const cacheData = JSON.stringify({ rate: rate, time: Date.now() });
-                setCookie(`vps_rate_${base}`, cacheData, 12);
+                setCookie(`vps_rate_${base}`, cacheData, RATE_CACHE_HOURS);
                 saveInputsToCookie();
             } else {
-                throw new Error("Currency not found");
+                throw new Error("Invalid rate value");
             }
         } else {
             throw new Error("API Error");
         }
     } catch (error) {
         console.error(error);
-        els.apiRateDisplay.textContent = "ERR";
+        els.apiRateDisplay.textContent = "汇率刷新";
         els.refreshIcon.classList.remove('spin');
         showToast("获取汇率失败");
     }
@@ -326,7 +648,7 @@ async function fetchExchangeRate() {
 
 function finishRateUpdate(rate, text) {
     els.customRate.value = rate.toFixed(4);
-    els.apiRateDisplay.textContent = text;
+    els.apiRateDisplay.textContent = "汇率刷新";
     els.refreshIcon.classList.remove('spin');
     calculate();
 }
@@ -347,8 +669,6 @@ function hideRateLimitTip() {
     }
 }
 
-window.hideRateLimitTip = hideRateLimitTip;
-
 function showToast(msg) {
     els.toast.textContent = msg;
     els.toast.classList.add('show');
@@ -360,7 +680,11 @@ function showToast(msg) {
 function initDates() {
     const now = new Date();
     els.tradeDate.value = formatDate(now);
-    if (els.dueDate.value) return;
+    syncDateDisplay(els.tradeDate);
+    if (els.dueDate.value) {
+        syncDateDisplay(els.dueDate);
+        return;
+    }
     const currentYear = now.getFullYear();
     const thisYearNov25 = new Date(currentYear, 10, 25); 
     let targetDueDate;
@@ -370,6 +694,7 @@ function initDates() {
         targetDueDate = new Date(currentYear + 1, 10, 25);
     }
     els.dueDate.value = formatDate(targetDueDate);
+    syncDateDisplay(els.dueDate);
 }
 
 function formatDate(date) {
@@ -381,17 +706,25 @@ function formatDate(date) {
 
 function updateCurrencySymbol() {
     const code = els.currency.value;
-    els.symbolDisplay.textContent = currencySymbols[code] || code;
+    const sym = currencySymbols[code] || code;
+    els.symbolDisplay.textContent = sym;
+    // Dynamically adjust input left padding to prevent symbol/text overlap
+    requestAnimationFrame(() => {
+        const symRect = els.symbolDisplay.getBoundingClientRect();
+        const inputRect = els.price.getBoundingClientRect();
+        const neededPad = symRect.right - inputRect.left + 6;
+        els.price.style.paddingLeft = Math.max(neededPad, 32) + 'px';
+    });
 }
 
 function calculate() {
-    syncDateDisplays();
-
-    const price = parseFloat(els.price.value) || 0;
-    const rate = parseFloat(els.customRate.value) || 0;
+    const priceRaw = parseFloat(els.price.value);
+    const rateRaw = parseFloat(els.customRate.value);
+    const price = Number.isFinite(priceRaw) && priceRaw >= 0 ? priceRaw : 0;
+    const rate = Number.isFinite(rateRaw) && rateRaw > 0 ? rateRaw : 0;
     const due = new Date(els.dueDate.value);
     const trade = new Date(els.tradeDate.value);
-    
+
     let cycleDays = 365;
     for (const radio of els.cycles) {
         if (radio.checked) { cycleDays = parseInt(radio.value); break; }
@@ -400,35 +733,58 @@ function calculate() {
     const totalCNY = price * rate;
     els.priceCNYPreview.textContent = `≈${totalCNY.toFixed(2)}元`;
 
-    if (isNaN(due.getTime()) || isNaN(trade.getTime())) return;
+    // 空 / 非法日期：清空结果区，给出占位提示
+    if (isNaN(due.getTime()) || isNaN(trade.getTime())) {
+        remainingValueCNY = 0;
+        setFinalValueDisplay('0.00');
+        els.originalCurrencyValue.textContent = '请填写到期日 / 交易日';
+        els.daysRemaining.textContent = '--';
+        els.progressBar.style.width = '0%';
+        els.progressText.textContent = '--';
+        syncQuoteFields();
+        return;
+    }
 
     const diffTime = due - trade;
     const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-    const dailyPrice = price / cycleDays;
-    
-    let valOrig = 0, valCNY = 0, progress = 0;
+    const dailyPrice = cycleDays > 0 ? price / cycleDays : 0;
 
-    if (diffDays <= 0) {
-        valOrig = 0; valCNY = 0; progress = 0; 
-    } else {
+    let valOrig = 0, valCNY = 0;
+
+    if (diffDays > 0) {
         valOrig = dailyPrice * diffDays;
         valCNY = valOrig * rate;
-        let baseDays = cycleDays;
-        if (diffDays > cycleDays) {
-            baseDays = cycleDays * Math.ceil(diffDays / cycleDays);
-        }
-        progress = (diffDays / baseDays) * 100;
     }
-    
-    let visualProgress = progress;
-    if (visualProgress > 100) visualProgress = 100;
-    if (visualProgress < 0) visualProgress = 0;
 
-    els.progressBar.style.width = `${visualProgress}%`;
-    els.finalValue.textContent = valCNY.toFixed(2);
+    // 进度条语义：当前续费周期内的「剩余比例」，文案显示按总剩余天数 / 周期取整。
+    let progressPct;
+    let displayProgressPct;
+    if (diffDays <= 0) {
+        progressPct = 0;
+        displayProgressPct = 0;
+    } else if (diffDays >= cycleDays) {
+        progressPct = 100;
+        displayProgressPct = Math.round((diffDays / cycleDays) * 100);
+    } else {
+        displayProgressPct = Math.max(1, Math.round((diffDays / cycleDays) * 100));
+        progressPct = displayProgressPct;
+    }
+
+    els.progressBar.style.width = `${progressPct}%`;
+    remainingValueCNY = valCNY;
+    setFinalValueDisplay(valCNY.toFixed(2));
     els.originalCurrencyValue.textContent = `≈ ${valOrig.toFixed(2)} ${els.currency.value}`;
-    els.daysRemaining.textContent = diffDays > 0 ? diffDays : "0";
-    els.progressText.textContent = `${progress.toFixed(1)}%`;
+    els.daysRemaining.textContent = diffDays > 0 ? diffDays : '0';
+    els.progressText.textContent = `${displayProgressPct}%`;
+    syncQuoteFields();
+}
+
+function setFinalValueDisplay(value) {
+    els.finalValue.textContent = value;
+    const numericLength = value.replace(/[^0-9]/g, '').length;
+    const isLongValue = numericLength >= 7;
+    els.finalValue.classList.toggle('final-value-long', isLongValue);
+    els.finalValue.closest('.result-amount-row')?.classList.toggle('final-value-row-long', isLongValue);
 }
 
 function copyResult() {
@@ -438,6 +794,8 @@ function copyResult() {
     const days = els.daysRemaining.textContent;
     const valCNY = els.finalValue.textContent;
     const valOrig = els.originalCurrencyValue.textContent.replace('≈', '').trim().split(' ')[0];
+    const premium = els.premiumInput.value || '0.00';
+    const salePrice = els.salePriceInput.value || valCNY;
     const tradeDate = els.tradeDate.value;
     const dueDate = els.dueDate.value;
     
@@ -450,20 +808,65 @@ function copyResult() {
     }
 
     const cnyPrice = (parseFloat(price) * parseFloat(rate)).toFixed(2);
-    const md = `## VPS 剩余价值
-- 交易日期：${tradeDate}
-- 外币汇率：1 ${currency} ≈ ${rate} CNY
-- 续费价格：${price} ${currency}/${cycleText}（约${cnyPrice}元）
-- 剩余天数：${days}天（${dueDate} 到期）
-- 剩余价值：${valCNY}元（约${valOrig} ${currency}）`;
+    const md = `## 🐔 VPS 剩余价值
+- 📅 交易日期：${tradeDate}
+- 💹 外币汇率：1 ${currency} ≈ ${rate} CNY
+- 💰 续费价格：${price} ${currency}/${cycleText}（约 ${cnyPrice} 元）
+- ⏳ 剩余天数：${days}天（${dueDate} 到期）
+- 💎 剩余价值：${valCNY}元（约 ${valOrig} ${currency}）
+- 🧾 溢价 / 售价：${premium}元 / ${salePrice}元`;
 
-    const textArea = document.createElement("textarea");
-    textArea.value = md;
-    document.body.appendChild(textArea);
-    textArea.select();
-    document.execCommand("copy");
-    document.body.removeChild(textArea);
-    showToast("已复制到剪贴板");
+    copyTextToClipboard(md, flashCopyButton);
+}
+
+function copyTextToClipboard(text, done) {
+    const fallbackCopy = () => {
+        const textArea = document.createElement("textarea");
+        textArea.value = text;
+        textArea.setAttribute('readonly', '');
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.select();
+        try { document.execCommand("copy"); } catch (_) {}
+        document.body.removeChild(textArea);
+    };
+
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(done).catch(() => { fallbackCopy(); done(); });
+    } else {
+        fallbackCopy();
+        done();
+    }
+}
+
+function copyFinalValueAmount() {
+    const amount = els.finalValue.textContent.trim();
+    if (!amount) return;
+    copyTextToClipboard(amount, flashAmountCopyTip);
+}
+
+function flashAmountCopyTip() {
+    if (!els.amountCopyTip) return;
+    els.amountCopyTip.classList.add('show');
+    clearTimeout(flashAmountCopyTip._t);
+    flashAmountCopyTip._t = setTimeout(() => {
+        els.amountCopyTip.classList.remove('show');
+    }, 1500);
+}
+
+function flashCopyButton() {
+    const btn = document.getElementById('copyBtn');
+    if (!btn) return;
+    const label = btn.querySelector('span');
+    const originalText = label ? label.textContent : '';
+    btn.classList.add('btn-copied');
+    if (label) label.textContent = '已复制 ✓';
+    clearTimeout(flashCopyButton._t);
+    flashCopyButton._t = setTimeout(() => {
+        btn.classList.remove('btn-copied');
+        if (label) label.textContent = originalText;
+    }, 1500);
 }
 
 const modal = {
@@ -481,6 +884,7 @@ function closeImageModal() {
         modal.actions.classList.add('hidden');
         modal.loading.classList.remove('hidden');
         modal.img.src = '';
+        resetGeneratedImage();
     }, 300);
 }
 
@@ -500,29 +904,39 @@ async function generateImage() {
     
     // Use setTimeout to allow UI to update before heavy lifting
     setTimeout(async () => {
-        const node = document.getElementById('mainCard');
-        const isDark = document.documentElement.classList.contains('dark');
-        const restoreDateInputs = prepareDateInputsForExport(node);
-        const restoreSelectInputs = prepareSelectInputsForExport(node);
+        const node = document.getElementById('captureRoot');
+        const mainCard = document.getElementById('mainCard');
+        node.classList.add('exporting');
+        mainCard.classList.add('exporting');
+        const restoreQuoteSection = prepareQuoteSectionForExport(mainCard);
+        const restoreDateInputs = prepareDateInputsForExport(mainCard);
+        const restoreNumberInputs = prepareNumberInputsForExport(mainCard);
+        const restoreSelectInputs = prepareSelectInputsForExport(mainCard);
 
         try {
             const htmlToImage = await getHtmlToImage();
-            const dataUrl = await htmlToImage.toPng(node, {
-                quality: 0.95,
-                pixelRatio: 2,
-                backgroundColor: isDark ? '#000000' : '#f0f2f5',
+            const rect = node.getBoundingClientRect();
+            const pixelRatio = SHARE_IMAGE_PIXEL_RATIO;
+            const canvas = await htmlToImage.toCanvas(node, {
+                width: Math.ceil(rect.width),
+                height: Math.ceil(rect.height),
+                pixelRatio,
                 filter: (element) => {
                     if (!element || !element.id) return true;
-                    return element.id !== 'btnContainer';
+                    return !['themeToggle', 'btnContainer', 'footerWrap'].includes(element.id);
                 },
                 style: {
                     transform: 'scale(1)',
                 }
             });
+            const roundedCanvas = clipCanvasToRoundedRect(canvas, EXPORT_BORDER_RADIUS * pixelRatio);
+            const blob = await canvasToBlob(roundedCanvas, SHARE_IMAGE_MIME_TYPE, SHARE_IMAGE_QUALITY);
+            resetGeneratedImage();
+            generatedImageUrl = URL.createObjectURL(blob);
 
             console.log('Image generated successfully');
             modal.loading.classList.add('hidden');
-            modal.img.src = dataUrl;
+            modal.img.src = generatedImageUrl;
             modal.img.classList.remove('hidden');
             modal.actions.classList.remove('hidden');
         } catch (e) {
@@ -531,16 +945,31 @@ async function generateImage() {
             showToast('生成出错');
         } finally {
             restoreSelectInputs();
+            restoreNumberInputs();
             restoreDateInputs();
+            restoreQuoteSection();
+            mainCard.classList.remove('exporting');
+            node.classList.remove('exporting');
         }
     }, 100);
 }
 
-// Expose functions to global scope for HTML onclick attributes
-window.copyResult = copyResult;
-window.generateImage = generateImage;
-window.closeImageModal = closeImageModal;
-window.hideRateLimitTip = hideRateLimitTip;
-window.manualRefreshRate = manualRefreshRate;
-window.toggleTheme = toggleTheme;
+// 用 addEventListener 绑定（替代 inline onclick），保持 HTML 与逻辑解耦
+function bindActionButtons() {
+    const map = [
+        ['copyBtn', copyResult],
+        ['imgBtn', generateImage],
+        ['closeImageModalBtn', closeImageModal],
+    ];
+    for (const [id, fn] of map) {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('click', fn);
+    }
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bindActionButtons);
+} else {
+    bindActionButtons();
+}
 
